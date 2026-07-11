@@ -14,6 +14,7 @@ def main():
     print(f"Dummy GS-232 logger on {args.listen_host}:{args.listen_port}")
 
     while True:
+        print("Waiting for connection...")
         conn, addr = srv.accept()
         print("GPredict connected from", addr)
         with conn:
@@ -22,7 +23,7 @@ def main():
                 if not data:
                     break
                 cmd = data.decode("ascii", errors="ignore").strip()
-                print("→ GPredict:", repr(cmd))
+                print("→ SatDump:", repr(cmd))
                 # Minimal echo responses so GS-232 stays happy
                 if cmd.upper().startswith("AZ"):
                     resp = cmd.upper()  # echo back same
@@ -35,4 +36,5 @@ def main():
         print("GPredict disconnected")
 
 if __name__ == "__main__":
+    print("Script started")
     main()
