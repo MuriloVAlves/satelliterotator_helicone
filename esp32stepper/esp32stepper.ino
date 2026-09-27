@@ -36,7 +36,7 @@ enum Screen_Types { NOT_CON,
                     COMM_INFO };
 Screen_Types screen_status = NOT_CON;
 unsigned long lastRefresh = 0;
-const unsigned long refreshInterval = 200;
+const unsigned long refreshInterval = 500;
 
 
 // GS-232 state
@@ -48,7 +48,7 @@ bool azMove = false, elMove = false;
 bool satdumpConnected = false;
 String inputCommand;
 unsigned long lastUpdateMs = 0;
-const unsigned long updateInterval = 3000;
+const unsigned long updateInterval = 5000;
 
 // DRV8825 variables
 // Shared M0, M1, M2, RST and DIR pins
@@ -86,8 +86,8 @@ const uint8_t steps_factor = 3; // slow down factor
 uint8_t step_az_accel = 0, step_el_accel = 0; // acceleration steps until transition
 // Step frequencies
 #define STEP_FREQ 2000 // Hz
-#define STP_SWITCH_PERIOD 1000000/(2*STEP_FREQ) //us
-unsigned long lastStepUs = 0;
+#define STP_SWITCH_PERIOD 100/(2*STEP_FREQ) //ms
+unsigned long lastStepMillis = 0;
 
 /********** Functions **********/
 
@@ -186,9 +186,9 @@ String handle_command(){
     double rawTargetAz = update_values.substring(0,command_split).toDouble();
     targetEl = update_values.substring(command_split + 1).toDouble();
     // Serial.println("Set targets: "+String(targetAz,3)+" "+String(targetEl,3));
-    double option_current = rawTargetAz;          
-    double option_plus    = rawTargetAz + 360.0;  
-    double option_minus   = rawTargetAz - 360.0;  
+    double option_current = rawTargetAz;
+    double option_plus    = rawTargetAz + 360.0;
+    double option_minus   = rawTargetAz - 360.0;
 
     double dist_curr  = abs(option_current - actualAz);
     double dist_plus  = abs(option_plus - actualAz);
@@ -221,7 +221,7 @@ String handle_command(){
     const double LIMIT_MAX = 535.0;
 
     if (bestTarget > LIMIT_MAX) {
-        bestTarget = option_minus; 
+        bestTarget = option_minus;
     } else if (bestTarget < LIMIT_MIN) {
         bestTarget = option_plus;
     }
@@ -262,160 +262,77 @@ double wrap_az(){
   return(actualAz);
 }
 
-void step_accel(char axis_rot){
-  if(axis_rot == 'A'){
-    if (step_az_accel == 0){
-      step_az_accel = steps_until_transition;
-      if(step_az_micro > 0){
-        step_az_micro -= 1;
-      }
+void step_accel(int *accel, int *micro) {
+    if (*accel == 0) {
+        *accel = steps_until_transition;
+        if (*micro > 0) {
+            *micro -= 1;
+        }
+    } else {
+        *accel -= 1;
     }
-    else{
-      step_az_accel -= 1;
-    }
-  }
-  else{
-    if (step_el_accel == 0){
-      step_el_accel = steps_until_transition;
-      if(step_el_micro > 0){
-        step_el_micro -= 1;
-      }
-    }
-    else{
-      step_el_accel -= 1;
-    }
-  }
-}
-void step_deaccel(char axis_rot){
-  if(axis_rot == 'A'){
-    if (step_az_micro < MIN_STEP_IDX){
-      step_az_micro += 1;
-    }
-  }
-  else{
-    if (step_el_micro < MIN_STEP_IDX){
-      step_el_micro += 1;
-    }
-  }
 }
 
-void start_invertion(char axis_rot){
-  if(axis_rot == 'A'){
-    if (step_az_micro == MIN_STEP_IDX){
-      step_az_dir = !step_az_dir;
+void step_deaccel(int *micro) {
+    if (*micro < MIN_STEP_IDX) {
+        *micro += 1;
     }
-    else{
-      step_deaccel('A');
+}
+
+void start_invertion(int *micro, bool *dir) {
+    if (*micro == MIN_STEP_IDX) {
+        *dir = !(*dir);
+    } else {
+        step_deaccel(micro);
     }
-  }
-  else{
-    if (step_el_micro == MIN_STEP_IDX){
-      step_el_dir = !step_el_dir;
-    }
-    else{
-      step_deaccel('E');
-    }
-  }
 }
 
 void handle_steppers(){
-  // Serial.println("Handle steppers");
-  // AZIMUTH
-  // Check if step is enabled
-  if (azMove){
-    // Calculate delta
-    delta_az = targetAz - actualAz;
-    // Serial.println("Delta Az: "+String(delta_az,4)+" Vel: "+String(step_az_micro));
-    // Disable step if there is no more step to have
-    if (abs(delta_az) < SMALLEST_STP)
-    {
-      azMove = false;
+    // AZIMUTH
+    handle_axis(&azMove, targetAz, actualAz, &delta_az,
+                &step_az_dir, AZ_POS_DIR, AZ_NEG_DIR,
+                &step_az_micro, &step_az_accel);
+
+    // ELEVATION
+    handle_axis(&elMove, targetEl, actualEl, &delta_el,
+                &step_el_dir, EL_POS_DIR, EL_NEG_DIR,
+                &step_el_micro, &step_el_accel);
+}
+void handle_axis(bool *move, float target, float actual, float *delta,
+                 int *step_dir, int pos_dir, int neg_dir,
+                 int *step_micro, int *step_accel) {
+    // Check if step is enabled
+    if (*move) {
+        *delta = target - actual;
+        // Disable step if there is no more step to have
+        if (abs(*delta) < SMALLEST_STP) {
+            *move = false;
+        } else { // If movement is still necessary
+            if (*delta > 0) {
+                if (*step_dir == pos_dir) {
+                    // Handle decel vs acceleration
+                    if (abs(*delta) < steps_factor * step_angles[*step_micro]) {
+                        step_deaccel(step_micro);
+                    } else {
+                        step_accel(step_accel, step_micro);
+                    }
+                } else {
+                    start_invertion(step_micro, step_dir);
+                }
+            } else {
+                if (*step_dir == neg_dir) {
+                    // Handle decel vs acceleration
+                    if (abs(*delta) < steps_factor * step_angles[*step_micro]) {
+                        step_deaccel(step_micro);
+                    } else {
+                        step_accel(step_accel, step_micro);
+                    }
+                } else {
+                    start_invertion(step_micro, step_dir);
+                }
+            }
+        }
     }
-    else{ // if movement is still necessary
-      // Handle changes of directions
-      // Confirm direction of rotation
-      if(delta_az >0){
-        // Check if change of direction is needed
-        if (step_az_dir == AZ_POS_DIR){
-          // Handle decel
-          if(abs(delta_az) < steps_factor*step_angles[step_az_micro]){
-            step_deaccel('A');
-          }
-          else{
-            // Handle acceleration
-            step_accel('A');
-          }
-        }
-        else{
-          start_invertion('A');
-        }
-      }
-      else{
-        // Check if change of direction is needed
-        if (step_az_dir == AZ_NEG_DIR){
-          // Handle decel
-          if(abs(delta_az) < steps_factor*step_angles[step_az_micro]){
-            step_deaccel('A');
-          }
-          else{
-            // Handle acceleration
-            step_accel('A');
-          }
-        }
-        else{
-          start_invertion('A');
-        }
-      }
-    }
-  }
-  // ELEVATION
-  // Check if step is enabled
-  if (elMove){
-    // Calculate delta
-    delta_el = targetEl - actualEl;
-    //Serial.println("Delta El: "+String(delta_el,4));
-    // Disable step if there is no more step to have
-    if (abs(delta_el) < SMALLEST_STP)
-    {
-      elMove = false;
-    }
-    else{ // if movement is still necessary
-      // Handle changes of directions
-      // Confirm direction of rotation
-      if(delta_el >0){
-        // Check if change of direction is needed
-        if (step_el_dir == EL_POS_DIR){
-          // Handle decel
-          if(abs(delta_el) < steps_factor*step_angles[step_el_micro]){
-            step_deaccel('E');
-          }
-          else{
-            // Handle acceleration
-            step_accel('E');
-          }
-        }
-        else{
-          start_invertion('E');
-        }
-      }
-      else{
-        // Check if change of direction is needed
-        if (step_el_dir == EL_NEG_DIR){
-          // Handle decel
-          if(abs(delta_el) < steps_factor*step_angles[step_el_micro]){
-            step_deaccel('E');
-          }
-          else{
-            // Handle acceleration
-            step_accel('E');
-          }
-        }
-        else{
-          start_invertion('E');
-        }
-      }
-    }
-  }
 }
 
 void step_motors(){
@@ -427,7 +344,7 @@ void step_motors(){
   }
   // Serial.println("Handled step");
   // If it's time for one more step
-  if (micros() - lastStepUs > STP_SWITCH_PERIOD){
+  if (millis() - lastStepMillis > STP_SWITCH_PERIOD){
     handle_steppers();
     if(azMove){
       //Write pin control
@@ -466,7 +383,7 @@ void step_motors(){
       }
     }
   }
-  lastStepUs = micros();
+  lastStepMilis = millis();
 }
 
 
@@ -534,7 +451,7 @@ void setup() {
 
 void loop() {
   // MOTOR MANAGEMENT
-  // Executed on every single loop cycle to ensure stepper motor pulses 
+  // Executed on every single loop cycle to ensure stepper motor pulses
   step_motors();
 
   // TCP CONNECTION MANAGEMENT (NON-BLOCKING)
@@ -584,12 +501,12 @@ void loop() {
       updateOrientationDisplay();
       lastUpdateMs = millis();
     }
-    
+
     if (millis() - lastRefresh >= refreshInterval) {
       update_screen();
       lastRefresh = millis();
     }
-  } 
+  }
   else if (satdumpConnected && !activeClient.connected()) {
     // Clean up when the client disconnects or if SatDump closes the socket voluntarily
     activeClient.stop();
