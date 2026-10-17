@@ -102,10 +102,82 @@ static double pos_est_el, vel_est_el, accel_est_el = 0;
 // Queues to handle external requests
 static const uint8_t receivedGuessLen = 5;
 static QueueHandle_t receivedGuess;
+TaskHandle_t TaskFilter = NULL;
 
 
 
 /********** Functions **********/
+
+// Alpha-Beta-Gamma Filter Structure & Logic
+struct AlphaBetaGammaFilter {
+    double pos = 0;
+    double vel = 0;
+    double accel = 0;
+    unsigned long last_updt = 0;
+    bool first_run = true;
+};
+
+// Global filter instances for Azimuth and Elevation
+AlphaBetaGammaFilter azFilter;
+AlphaBetaGammaFilter elFilter;
+
+void update_filter(AlphaBetaGammaFilter &filter, double new_val, double alpha, double beta, double gamma) {
+    unsigned long now = millis();
+
+    if (filter.first_run) {
+        filter.pos = new_val;
+        filter.last_updt = now;
+        filter.first_run = false;
+        return;
+    }
+
+    // Convert millis difference to seconds
+    double delta = (double)(now - filter.last_updt) / 1000.0;
+    if (delta <= 0) {
+        delta = 0.001; // Prevent division by zero
+    }
+
+    // 1. PREDICTION STEP (Where the state should be based on elapsed time)
+    double pos_pred = filter.pos + (filter.vel * delta) + (0.5 * filter.accel * (delta * delta));
+    double vel_pred = filter.vel + (filter.accel * delta);
+    double accel_pred = filter.accel;
+
+    // 2. RESIDUAL / ERROR CALCULATION (Real measurement vs. prediction)
+    double r = new_val - pos_pred;
+
+    // 3. UPDATE STEP (Correction using alpha, beta, gamma gains)
+    filter.pos   = pos_pred   + alpha * r;
+    filter.vel   = vel_pred   + (beta / delta) * r;
+    filter.accel = accel_pred + (2.0 * gamma / (delta * delta)) * r;
+
+    filter.last_updt = now;
+}
+
+void filter_task(void *parameters) {
+  TickType_t xLastWakeTime;
+  const TickType_t xFrequency = PREDICT_PERIOD / portTICK_PERIOD_MS;
+  xLastWakeTime = xTockGetTickCount(); // Or xTaskGetTickCount() depending on FreeRTOS version
+
+  while (1) {
+    // Example: Filtering Azimuth and Elevation positions
+    // You can swap 'actualAz' with whatever raw sensor reading or target you want to smooth
+    update_filter(azFilter, actualAz, ALPHA_AZ, BETA_AZ, GAMMA_AZ);
+    update_filter(elFilter, actualEl, ALPHA_EL, BETA_EL, GAMMA_EL);
+
+    // Store estimated values into your global prediction variables if needed
+    pos_est_az = azFilter.pos;
+    vel_est_az = azFilter.vel;
+    accel_est_az = azFilter.accel;
+
+    pos_est_el = elFilter.pos;
+    vel_est_el = elFilter.vel;
+    accel_est_el = elFilter.vel;
+
+    // Wait for the next prediction period cycle precisely
+    vTaskDelayUntil(&xLastWakeTime, xFrequency);
+  }
+}
+
 // LCD String handling
 String str_stuffing(String text) {
   String new_text = text;
@@ -328,7 +400,8 @@ void step_motors(void *parameters){
     // TODO: HANDLE FAULTY CURRENT
     if (!(azMove || elMove)){
       // if movement is not necessary
-      return;
+      vTaskDelay(10 / portTICK_PERIOD_MS);
+      continue;
     }
     // Serial.println("Handled step");
     // If it's time for one more step
@@ -383,14 +456,14 @@ void update_filter(void *parameters){
 
   now = time.time()
   delta = now - self.last_updt
-  
+
   if self.first_run:
       self.pos = new_val
       self.last_updt = now
       self.first_run = False
       return
 
-  if delta <= 0: 
+  if delta <= 0:
       delta = 0.001
 
   // 1. PASSO DE PREDIÇÃO (Onde o estado deveria estar baseado no tempo)
@@ -486,7 +559,7 @@ void handle_tcp_request(void *parameters){
   static bool clientConnected = false; //Memory to pass with queue method
   // Start the socket server
   tcpServer.begin();
-  
+
   while(1){
     if (!activeClient) {
       // If no client is currently active, check for a incoming connection
@@ -540,13 +613,14 @@ void handle_tcp_request(void *parameters){
   }
 }
 
-
+/********** FreeRTOS Task Handles (Add near top variables) **********/
+TaskHandle_t TaskDisplay = NULL;
+TaskHandle_t TaskMotors = NULL;
+TaskHandle_t TaskTCP = NULL;
 
 /********** Arduino Loop **********/
-
 void setup() {
   // setup pins
-  // stepper
   pinMode(M0_PIN,OUTPUT);
   pinMode(M1_PIN,OUTPUT);
   pinMode(M2_PIN,OUTPUT);
@@ -556,19 +630,17 @@ void setup() {
   pinMode(STEP_EL_PIN,OUTPUT);
   pinMode(FAULT_AZ_PIN,INPUT);
   pinMode(FAULT_EL_PIN,INPUT);
+
   // init serial
   Serial.begin(115200);
 
   // initialize LCD
   display.init();
-  // clear display
   display.setCursor(0, 0);
   display.print("                ");
   display.setCursor(0, 1);
   display.print("                ");
-  // turn on LCD backlight
   display.backlight();
-  // Set init message
   display.setCursor(0, 0);
   display.print("Initializing... ");
 
@@ -581,7 +653,6 @@ void setup() {
       display.setCursor(0, 1);
       display.print("IP configured!");
     }
-
   #else
   // Connect to Wi-Fi network
   Serial.println("Trying to connect to Wi-Fi");
@@ -606,15 +677,55 @@ void setup() {
   Serial.println(WiFi.localIP());
   #endif
 
-
   // Create Queues
-  // LCD
   connectedQueue = xQueueCreate(connectedQueueLen, sizeof(bool));
+  receivedGuess = xQueueCreate(receivedGuessLen, sizeof(double));
 
+  // Create FreeRTOS Tasks
+  // --- CORE 0: Network & UI Tasks ---
+  xTaskCreatePinnedToCore(
+    handle_tcp_request,
+    "TCPTask",
+    4096,
+    NULL,
+    2, // <-- Higher priority for faster data transfering
+    &TaskTCP,
+    0
+  );
+
+  xTaskCreatePinnedToCore(
+    handle_display,
+    "DisplayTask",
+    2048,
+    NULL,
+    1,
+    &TaskDisplay,
+    0
+  );
+
+  // --- CORE 1: Real-Time Motor & Calculation Tasks ---
+  xTaskCreatePinnedToCore(
+    step_motors,
+    "MotorTask",
+    2048,
+    NULL,
+    2,  // <-- Higher priority for smooth stepping
+    &TaskMotors,
+    1
+  );
+
+  xTaskCreatePinnedToCore(
+    filter_task,
+    "FilterTask",
+    2048,
+    NULL,
+    1,
+    &TaskFilter,
+    1
+  );
 }
 
 void loop() {
-  // MOTOR MANAGEMENT
-  // Executed on every single loop cycle to ensure stepper motor pulses
-  // step_motors();
+  // Leave empty when using FreeRTOS tasks, or handle low-priority background tasks here.
+  vTaskDelay(1000 / portTICK_PERIOD_MS);
 }
